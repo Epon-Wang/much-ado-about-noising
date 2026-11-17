@@ -17,7 +17,12 @@ from mip.config import Config
 from mip.dataset_utils import loop_dataloader
 from mip.datasets.pusht_dataset import make_dataset
 from mip.envs.pusht import make_vec_env
-from mip.logger import Logger, compute_average_metrics, update_best_metrics
+from mip.logger import (
+    Logger,
+    compute_average_metrics,
+    get_checkpoint_base_name,
+    update_best_metrics,
+)
 from mip.samplers import get_default_step_list
 from mip.scheduler import WarmupAnnealingScheduler
 from mip.torch_utils import set_seed
@@ -176,11 +181,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
                     # Save to global checkpoints directory with success rate comparison
                     # Include training state for resuming
-                    checkpoint_base_name = (
-                        f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-                        f"{config.optimization.loss_type}_{config.network.network_type}_"
-                        f"{config.network.emb_dim}_seed{config.optimization.seed}"
-                    )
+                    checkpoint_base_name = get_checkpoint_base_name(config)
                     training_state = {
                         "n_gradient_step": n_gradient_step,
                         "best_metrics": best_metrics,
@@ -364,14 +365,12 @@ def main(config):
 
     if config.optimization.model_path and config.optimization.model_path != "None":
         loguru.logger.info(f"Loading model from {config.optimization.model_path}")
-        resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
+        resume_state = agent.load(
+            config.optimization.model_path, load_optimizer=(config.mode == "train")
+        )
     elif config.mode == "train" and config.optimization.auto_resume:
         # Automatically look for checkpoint to resume from
-        checkpoint_base_name = (
-            f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-            f"{config.optimization.loss_type}_{config.network.network_type}_"
-            f"{config.network.emb_dim}_seed{config.optimization.seed}"
-        )
+        checkpoint_base_name = get_checkpoint_base_name(config)
         checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)
         if checkpoint_path:
             loguru.logger.info(f"Found checkpoint to resume from: {checkpoint_path}")

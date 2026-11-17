@@ -27,3 +27,5 @@ use_compile: false
 compile_mode: null # Compile mode: null, "default", "reduce-overhead", "max-autotune"
 use_cudagraphs: false # Whether to use CUDA graphs (requires static shapes)
 auto_resume: true
+frozen_encoder_path: null # Checkpoint whose EMA encoder is loaded and frozen; only the action network trains
+ckpt_tag: "" # Appended to the global checkpoint name so variant runs never resume from or overwrite each other

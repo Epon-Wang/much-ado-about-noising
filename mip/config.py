@@ -44,6 +44,10 @@ class OptimizationConfig:
     )
     use_cudagraphs: bool = False  # Whether to use CUDA graphs (requires static shapes)
     auto_resume: bool = True  # Whether to automatically resume from checkpoint
+    # Checkpoint whose encoder_ema is loaded and frozen
+    frozen_encoder_path: str | None = None
+    # Appended to the global checkpoint name; required with frozen_encoder_path
+    ckpt_tag: str = ""
 
 
 @dataclass

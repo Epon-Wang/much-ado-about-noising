@@ -44,6 +44,28 @@ class TrainingAgent:
             config.optimization.device
         )
         report_parameters(self.encoder, model_name="Encoder Network")
+
+        frozen_path = getattr(config.optimization, "frozen_encoder_path", None)
+        self.frozen_encoder = frozen_path not in (None, "", "None")
+        if self.frozen_encoder:
+            if not getattr(config.optimization, "ckpt_tag", ""):
+                raise ValueError(
+                    "optimization.ckpt_tag must be set when "
+                    "optimization.frozen_encoder_path is used"
+                )
+            donor = torch.load(
+                frozen_path,
+                map_location=config.optimization.device,
+                weights_only=False,
+            )
+            self.encoder.load_state_dict(donor["encoder_ema"])
+            self.encoder.requires_grad_(False)
+            self.encoder.eval()
+            loguru.logger.info(
+                f"Frozen encoder loaded from {frozen_path} "
+                f"({sum(p.numel() for p in self.encoder.parameters())} parameters)"
+            )
+
         self.encoder_ema = deepcopy(self.encoder).requires_grad_(False)
         self.flow_map_ema = deepcopy(self.flow_map).requires_grad_(False)
 
@@ -60,9 +82,8 @@ class TrainingAgent:
             self.flow_map_ema_detach = None
             self.encoder_ema_detach = None
 
-        params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
         self.optimizer = torch.optim.AdamW(
-            params,
+            self._trainable_params(),
             lr=config.optimization.lr,
             weight_decay=config.optimization.weight_decay,
         )
@@ -77,6 +98,20 @@ class TrainingAgent:
         self.use_compile = config.optimization.use_compile
         self.compile_mode = config.optimization.compile_mode
         self.__compile__()
+
+    def _trainable_params(self):
+        """Parameters the optimizer updates (encoder first, unless it is frozen)."""
+        params = list(self.flow_map.parameters())
+        if not self.frozen_encoder:
+            params = list(self.encoder.parameters()) + params
+        return params
+
+    def _trainable_ema_params(self):
+        """EMA counterparts of `_trainable_params`, in the same order."""
+        params = list(self.flow_map_ema.parameters())
+        if not self.frozen_encoder:
+            params = list(self.encoder_ema.parameters()) + params
+        return params
 
     def __compile__(self):
         """Compile training and inference functions."""
@@ -177,7 +212,8 @@ class TrainingAgent:
                 # Restore training mode if it was training
                 if was_training:
                     self.flow_map.train()
-                    self.encoder.train()
+                    if not self.frozen_encoder:
+                        self.encoder.train()
 
     def _sync_detached_models(self):
         """Synchronize detached models with main models for CUDA graphs."""
@@ -229,7 +265,7 @@ class TrainingAgent:
             loss.backward()
 
             # Gradient clipping
-            params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
+            params = self._trainable_params()
             if self.config.optimization.grad_clip_norm:
                 grad_norm = nn.utils.clip_grad_norm_(
                     params, self.config.optimization.grad_clip_norm
@@ -259,10 +295,8 @@ class TrainingAgent:
 
     def _ema_update_impl(self):
         """EMA update implementation (can be part of compiled function)."""
-        params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
-        params_ema = list(self.encoder_ema.parameters()) + list(
-            self.flow_map_ema.parameters()
-        )
+        params = self._trainable_params()
+        params_ema = self._trainable_ema_params()
         with torch.no_grad():
             for p, p_ema in zip(params, params_ema, strict=False):
                 p_ema.data.mul_(self.config.optimization.ema_rate).add_(
@@ -319,10 +353,8 @@ class TrainingAgent:
 
     def ema_update(self):
         """Update exponential moving average parameters."""
-        params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
-        ema_params = list(self.encoder_ema.parameters()) + list(
-            self.flow_map_ema.parameters()
-        )
+        params = self._trainable_params()
+        ema_params = self._trainable_ema_params()
         with torch.no_grad():
             for p, p_ema in zip(params, ema_params, strict=False):
                 p_ema.data.mul_(self.config.optimization.ema_rate).add_(
@@ -472,6 +504,7 @@ class TrainingAgent:
     def train(self):
         """Set all models to training mode."""
         self.flow_map.train()
-        self.encoder.train()
         self.flow_map_ema.train()
-        self.encoder_ema.train()
+        if not self.frozen_encoder:
+            self.encoder.train()
+            self.encoder_ema.train()

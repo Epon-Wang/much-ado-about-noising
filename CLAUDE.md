@@ -4,141 +4,121 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MIP (Minimum Iterative Policy) is a PyTorch-based reinforcement learning framework focused on behavior cloning with flow matching. The project integrates with the Robomimic dataset and environment for training robotic manipulation policies.
+Code for the paper "Much Ado About Noising: Dispelling the Myths of Generative Robotic Control". The `mip` package is a PyTorch behavior-cloning framework built on the stochastic interpolant view: one network interface, many training objectives (flow matching, regression, MIP = Minimum Iterative Policy, and flow-map / self-distillation variants), evaluated on Robomimic, Franka Kitchen and PushT.
 
 ## Commands
 
-### Setup
-```bash
-# Install dependencies
-pip install -e .
+The project uses `uv` (Python 3.12, `uv.lock` is committed).
 
-# Install development dependencies
-pip install -e .[dev]
+```bash
+uv sync --extra dev                 # install with ruff + pytest
+
+uv run pytest                       # unit tests live in tests/*_test.py
+uv run pytest tests/losses_test.py
+uv run pytest tests/agent_test.py::TestTrainingAgent::test_agent_different_loss_types
+
+uv run ruff format .                # CI runs `ruff format --check .`
+uv run ruff check --fix .           # CI runs `ruff check .`
 ```
 
-### Training
-```bash
-# Train with default configuration
-python examples/train_robomimic.py
+CI (`.github/workflows/python-ci.yaml`) is exactly: `ruff format --check .`, `ruff check .`, `pytest`. The pre-commit hooks run the same two ruff commands through `uv run`.
 
-# Train with custom configuration
-python examples/train_robomimic.py task=lift_image  # For image-based observations
-python examples/train_robomimic.py optimization.batch_size=32  # Override batch size
-python examples/train_robomimic.py network=mlp  # Select network architecture
+### Training and evaluation
+
+```bash
+# Fast end-to-end check: 10 gradient steps, batch 2, 2 envs, wandb off, no auto-resume
+uv run examples/train_robomimic.py -cn exps/debug.yaml task=lift_ph_state network=mlp
+
+# Full runs (one script per benchmark)
+uv run examples/train_robomimic.py task=lift_ph_state network=chiunet optimization.loss_type=flow
+uv run examples/train_pusht.py task=pusht_state
+uv run examples/train_kitchen.py task=kitchen_state      # needs: uv pip install "mujoco==3.1.6"
+
+# Evaluate a checkpoint
+uv run examples/train_robomimic.py task=lift_ph_state_abs mode=eval optimization.model_path=/path/to/ckpt.pt
+
+# Sweep (Hydra multirun; launcher=cluster submits through submitit/SLURM)
+uv run examples/train_robomimic.py task=lift_ph_state,can_ph_state --multirun
 ```
 
-### Testing
-```bash
-# Run all tests
-pytest
+`examples/test_training/test_{robomimic,pusht,kitchen}.py` are standalone smoke-test scripts, not pytest tests: each one launches every task × network × {flow, mip, regression} combination through the debug config as a subprocess. Run with `uv run examples/test_training/test_robomimic.py`; they are slow and need the datasets and simulators.
 
-# Run specific test file
-pytest mip/agent_test.py
+### Docs
 
-# Run tests with verbose output
-pytest -v
-
-# Run tests for a specific network
-pytest mip/networks/mlp_test.py
-```
-
-### Code Quality
-```bash
-# Format code
-ruff format .
-
-# Lint code
-ruff check .
-
-# Fix linting issues automatically
-ruff check --fix .
-```
+The documentation site is VitePress under `docs/` (`cd docs && npm ci && npm run docs:dev`), deployed to GitHub Pages on every push to `main`.
 
 ## Architecture
 
-### Core Components
+### How an objective is assembled
 
-1. **Agent System** (`mip/agent.py`)
-   - `TrainingAgent`: Manages flow matching model training with EMA updates
-   - Handles observation encoding, flow map learning, and sampling
-   - Automatically selects encoder based on network config
+`TrainingAgent` (`mip/agent.py`) builds everything from the config. The single string `optimization.loss_type` selects three things that must stay in sync:
 
-2. **Flow Matching Framework**
-   - `mip/flow_map.py`: Neural network that learns the velocity field
-   - `mip/interpolant.py`: Interpolation between noise and data distributions
-   - `mip/samplers.py`: Various sampling strategies (Euler, Heun, etc.)
-   - `mip/losses.py`: Loss functions for flow matching training
+- `losses.get_loss_fn` — the training loss
+- `samplers.get_sampler` — the matching inference procedure
+- `samplers.get_default_step_list` — which `num_steps` values are evaluated (9, 3, 1 for flow-type objectives; 1 for `regression`, `mip`, `tsd`). It raises on unknown names, so a new objective must be registered here as well as in the other two.
 
-3. **Network Architecture** (`mip/networks/`)
-   - All networks inherit from `BaseNetwork` and follow a consistent interface
-   - Networks take (x, s, t, condition) and return (action, scalar) tuple
-   - Available networks: `mlp`, `vanilla_mlp` (more coming: `chitransformer`, `chiunet`, `dit`, `jannerunet`, `rnn`)
-   - Networks are configured via `network_utils.get_network()`
+Valid values: `flow`, `regression`, `straight_flow`, `tsd`, `mip`, `ctm`, `psd`, `lsd`, `esd`, `mf`, `lmd`. The math for each is in `docs/getting-started/design.md`.
 
-4. **Encoders** (`mip/encoders.py`)
-   - `IdentityEncoder`: Pass-through for state observations
-   - `MLPEncoder`: Multi-layer encoding for state observations
-   - `MultiImageObsEncoder`: CNN-based encoder for image observations
-   - Encoder selection is automatic based on `obs_type` and `encoder_type`
+Fixed signatures:
 
-5. **Dataset Pipeline** (`mip/datasets/`)
-   - `robomimic_dataset.py`: Handles Robomimic HDF5 dataset loading
-   - Supports both state and image observations
-   - Includes action/observation normalization
-   - Can load from HuggingFace or local paths
+```python
+loss_fn(config.optimization, flow_map, encoder, interpolant, act, obs, delta_t) -> (loss, info_dict)
+sampler(config.optimization, flow_map, encoder, act_0, obs) -> act
+network.forward(x, s, t, condition) -> (out, scalar)   # x: (B, Ta, act_dim); s, t: (B,)
+encoder(obs, mask) -> condition                        # called as encoder(obs, None)
+```
 
-6. **Environment Wrappers** (`mip/envs/`)
-   - `robomimic_env.py`: Base environment wrapper
-   - `robomimic_lowdim_wrapper.py`: State-based observations
-   - `robomimic_image_wrapper.py`: Image-based observations with frame stacking
+### Conventions that span files
 
-7. **Configuration System**
-   - Uses Hydra for hierarchical configuration
-   - Config files in `examples/configs/`
-   - Main config structure: `task`, `network`, `optimization`, `log`
-   - Config dataclasses in `mip/config.py`
+- **Time runs noise → data.** `Interpolant` gives `I_t = α(t)·a_0 + β(t)·a_1` with `a_0` Gaussian noise at `t=0` and `a_1` the action chunk at `t=1`.
+- **`FlowMap` wraps the network** as `X_{s,t}(x) = x + (t − s)·net(x, s, t, cond)`. `get_velocity(t, x, cond)` is the same network called with `s = t`. The network's second (scalar) output is discarded.
+- **For `regression`, `mip` and `tsd` the output of `get_velocity` is the action prediction itself**, not a velocity to integrate. MIP is two such calls: one from a zero input at `t=0`, one from that prediction at `t = optimization.t_two_step`.
+- **`delta_t` is a curriculum, not a step size.** `WarmupAnnealingScheduler` ramps it from 0 to 1 over training and the flow-map losses (`ctm`, `psd`, `lsd`, `esd`, `mf`, `lmd`) use it to cap the gap `t − s`. The other losses use it only as a shape/device template.
+- **`lsd`, `esd`, `mf`, `lmd` differentiate through the network** with `torch.func.jvp` + `vmap` (`FlowMap.jvp_*`). These do not work with the transformer networks; use a UNet.
+- **`ctm` and `lmd` call `flow_map.get_reference_velocity`**, which needs a `reference_net`. `TrainingAgent` builds `FlowMap(net)` without one; only `tests/losses_test.py` passes it.
+- **`act_0` passed to `agent.sample` only supplies shape and device.** The start point comes from `optimization.sample_mode`: `zero` (the YAML default) starts from zeros and makes sampling deterministic, `stochastic` starts from Gaussian noise.
+- **Networks are conditioned on encoder output, never raw observations.** `get_network` always builds the network with `obs_dim = network.emb_dim`, matching the `(B, obs_steps, emb_dim)` output of the `mlp`, `per_step_mlp` and image encoders (`identity` passes observations through unchanged). `obs_type: image` forces `MultiImageObsEncoder`; state and keypoint tasks use `network.encoder_type`.
+- **Evaluation uses the EMA weights.** Observations are normalized with `dataset.normalizer`, the sampled chunk is unnormalized, and steps `[obs_steps − 1 : obs_steps − 1 + act_steps]` of the `horizon`-long prediction are executed through `MultiStepWrapper`.
 
-### Training Pipeline
+### Configuration
 
-The training flow (`examples/train_robomimic.py`):
-1. Loads Hydra configuration
-2. Creates vectorized environments
-3. Initializes dataset with normalizers
-4. Creates `TrainingAgent` with flow map and encoder
-5. Runs training loop with:
-   - Batch sampling from dataloader
-   - Flow matching loss computation
-   - Gradient updates with optional EMA
-   - Periodic evaluation on environment
-   - Metric logging to Weights & Biases
+Hydra composes `examples/configs/main.yaml` from the groups `task`, `network`, `optimization`, `log` and `launcher`. Things that are easy to get wrong:
 
-### Key Design Patterns
+- **The YAML files are the real defaults.** The dataclasses in `mip/config.py` are type hints for the training scripts (which receive a plain `DictConfig`) and are instantiated directly only by unit tests. Their defaults differ from the YAML (for example `loss_scale` 100 vs 0.1, `sample_mode` `stochastic` vs `zero`, `use_compile` true vs false). A new option goes in both places. This is also why code probes optional keys with `getattr(cfg, key, default)` / `hasattr`.
+- **The config is mutated at startup.** `train_robomimic.py` overwrites `task.obs_dim` from the first env observation (or with `emb_dim` for images) and, for `network=chiunet`, rounds `task.horizon` up to a power of two.
+- **Datasets download from HuggingFace** (`ChaoyiPan/mip-dataset`) when `task.dataset_repo` and `task.dataset_filename` are present, and that branch is checked before `task.dataset_path`. The Robomimic env is also built from the dataset file's metadata, so env and dataset always share one file.
+- **Network YAMLs inherit `network/_base.yaml`** (encoder settings); Robomimic and PushT task YAMLs inherit `robomimic_base.yaml` / `pusht_base.yaml`.
 
-- **Modular Networks**: Networks (`mip/networks/`) are separate from agents
-- **Encoder-Decoder**: Separate observation encoder from action decoder (flow map)
-- **Dual Output**: Networks output both action predictions and scalar values for enhanced learning
-- **Normalization**: All observations/actions normalized during training via dataset normalizers
-- **Vectorized Environments**: Supports parallel environment execution with `make_vec_env()`
-- **Configurable Sampling**: Multiple ODE solvers for inference
-- **EMA Updates**: Exponential moving average for stable training
+### Robomimic action spaces
 
-## Configuration Structure
+Task files are named `{env}_{ph|mh}_{state|image}[_{variant}]`. For state tasks the variant picks the action space through `task.abs_action` + `task.action_type`, and it changes the dataset file, the env controller and the eval post-processing together:
 
-The configuration uses Hydra with these main groups:
-- `task/`: Environment and dataset settings (lift, lift_image, etc.)
-- `network/`: Neural network architectures (mlp, vanilla_mlp, etc.)
-- `optimization/`: Training hyperparameters
-- `log/`: Logging and evaluation settings
+| Suffix | Dataset file | `act_dim` (single / dual arm) | Behaviour |
+|---|---|---|---|
+| none, `_abs` | `low_dim_abs.hdf5` | 10 / 20 | Absolute EEF pose with 6D rotation; controller switched to absolute. The paper's setting. |
+| `_rel` | `low_dim_abs.hdf5` | 10 / 20 | Absolute actions re-expressed relative to the current EEF pose (`mip/action_utils.py`), converted back to absolute in the eval loop before stepping. |
+| `_delta` | `low_dim.hdf5` | 7 / 14 | Raw Robomimic delta actions, `abs_action: false`. |
+| `_delta_legacy` | `low_dim.hdf5` | 10 / 20 | Delta dataset pushed through the rot6d conversion while keeping the delta controller. Required to evaluate the released checkpoints. |
 
-Key configuration parameters:
-- `task.obs_type`: "state" or "image" (determines encoder type)
-- `task.horizon`: Action prediction horizon (typically 10)
-- `task.obs_steps`: Observation history length (typically 2)
-- `task.act_steps`: Action execution steps (typically 8)
-- `optimization.loss_type`: Flow matching loss variant ("flow" default)
-- `optimization.gradient_steps`: Total training steps
-- `optimization.batch_size`: Training batch size
-- `network.network_type`: Network architecture selection
-- `network.emb_dim`: Embedding dimension for networks
-- `network.num_layers`: Number of network layers
+### Checkpoints and auto-resume
+
+- Per run: `{log.log_dir}/models/model_{latest,best}.pt` and `{log.log_dir}/metrics.jsonl` (default `logs/`).
+- Global: `checkpoints/{env_name}_{env_type}_{obs_type}_{loss_type}_{network_type}_{emb_dim}_seed{seed}_success{pct}.pt`, relative to the working directory. Only the highest-success file per name is kept. "Best" is judged on `mean_success_{N}` for the first entry of the step list (9 steps for flow-type objectives).
+- `optimization.auto_resume` defaults to true and loads the matching global checkpoint, with optimizer and step count, at startup. The name does not encode the action-space variant or any other hyperparameter, so runs differing only in e.g. `_abs` vs `_rel` or learning rate resume from each other. Pass `optimization.auto_resume=false` or a different seed when that matters.
+
+### Three parallel training scripts
+
+`examples/train_{robomimic,pusht,kitchen}.py` are near-copies, each with its own `train` and eval loop, paired with `mip/datasets/{name}_dataset.make_dataset` and `mip/envs/{name}` `make_vec_env`. A change to the loop usually has to be mirrored in all three. `docs/development/add_new_task.md` describes porting a new benchmark this way; `add_new_method.md` and `add_new_architecture.md` cover objectives and networks.
+
+`train_robomimic.py` sets `MUJOCO_GL=osmesa` at import time, which overrides whatever is exported in the shell.
+
+### Compilation and CUDA graphs
+
+`optimization.use_compile` compiles the whole update (forward, backward, clipping, optimizer step, EMA) and the sampler. `optimization.use_cudagraphs` additionally wraps the update in `CudaGraphModule` and keeps detached parameter copies that are re-synced before each `sample` call. CUDA graphs need static shapes: state observations only, `drop_last=True` in the dataloader, and in-place sampling inside losses (`torch.empty_like(x).uniform_()` / `.normal_()` rather than `torch.rand*`) — keep that pattern in new losses.
+
+### Outside the `mip` package
+
+- `toyexp/toyexp/` — self-contained toy experiments with their own README, configs and dependencies.
+- `examples/process_dataset/` — scripts that produced the HuggingFace datasets (including the absolute-action conversion).
+- `examples/pi0_pytorch.diff` — reference diff showing how to port the MIP loss and sampler into another flow-policy codebase.
+- `mip/envs/kitchen/kitchen_thirdparty/` — vendored Franka Kitchen environment and assets.

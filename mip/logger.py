@@ -8,6 +8,7 @@ Date: 2025-10-03
 import contextlib
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -229,6 +230,32 @@ class Logger:
             loguru.logger.error(f"Failed to save model: {e}")
         if self._wandb:
             self._wandb.finish()
+
+
+def get_checkpoint_base_name(config) -> str:
+    """Return the base name of the global checkpoint files for this run.
+
+    The name is the legacy ``{env}_{type}_{obs}_{loss}_{network}_{emb}_seed{seed}``
+    format, with ``_{optimization.ckpt_tag}`` appended when a tag is set, so that
+    variant runs never resume from or overwrite each other's files.
+    """
+    name = (
+        f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
+        f"{config.optimization.loss_type}_{config.network.network_type}_"
+        f"{config.network.emb_dim}_seed{config.optimization.seed}"
+    )
+    tag = getattr(config.optimization, "ckpt_tag", None)
+    if tag is not None and tag != "":
+        tag = str(tag)
+        # Checkpoint code parses names with split("_success") and globs
+        # "{name}_success*.pt", so the tag must not contain "success".
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", tag) or "success" in tag:
+            raise ValueError(
+                f"Invalid optimization.ckpt_tag {tag!r}: use only letters, digits, "
+                "'.', '_' and '-', and do not include 'success'."
+            )
+        name = f"{name}_{tag}"
+    return name
 
 
 def update_best_metrics(best_metrics, current_metrics):
